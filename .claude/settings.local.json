@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(where npm:*)",
+      "Bash(command -v npm)",
+      "Bash(npx vite:*)",
+      "Bash(where node:*)",
+      "Bash(where npx:*)",
+      "Read(//c/Program Files/nodejs/**)"
+    ]
+  }
+}
