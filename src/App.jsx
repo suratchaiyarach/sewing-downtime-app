@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useLocalStorage } from './hooks/useLocalStorage'
-import { SEED_RECORDS, DEFAULT_CONFIG, DEFAULT_SESSION_INFO, DEFAULT_LINE_CONFIG } from './constants'
+import { supabase } from './lib/supabase'
+import { DEFAULT_SESSION_INFO, DEFAULT_LINE_CONFIG } from './constants'
 import { today, nowTime } from './utils'
 
 import Header          from './components/Header'
@@ -19,22 +20,29 @@ function getLineConfig(cfg, lineName) {
   return cfg.lines?.[lineName] ?? DEFAULT_LINE_CONFIG
 }
 
-function setLineConfig(cfg, lineName, updater) {
-  return {
-    ...cfg,
-    lines: {
-      ...cfg.lines,
-      [lineName]: updater(getLineConfig(cfg, lineName)),
-    },
-  }
+// Convert array of line_configs rows → { lines: { [lineName]: {...} } }
+function rowsToConfig(rows) {
+  const lines = {}
+  rows.forEach(r => {
+    lines[r.line_name] = {
+      machines:    r.machines    ?? DEFAULT_LINE_CONFIG.machines,
+      operators:   r.operators   ?? DEFAULT_LINE_CONFIG.operators,
+      assignments: r.assignments ?? DEFAULT_LINE_CONFIG.assignments,
+    }
+  })
+  return { lines }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
-  // ── Persisted state ───────────────────────────────────────────────────────
-  const [records,     setRecords]     = useLocalStorage('dt_records',  SEED_RECORDS)
-  const [config,      setConfig]      = useLocalStorage('dt_config',   DEFAULT_CONFIG)
-  const [sessionInfo, setSessionInfo] = useLocalStorage('dt_session',  DEFAULT_SESSION_INFO)
+  // ── Session info stays in localStorage (per-device UI state) ─────────────
+  const [sessionInfo, setSessionInfo] = useLocalStorage('dt_session', DEFAULT_SESSION_INFO)
+
+  // ── Supabase-backed state ─────────────────────────────────────────────────
+  const [records, setRecords] = useState([])
+  const [config,  setConfig]  = useState({ lines: {} })
+  const [loading, setLoading] = useState(true)
+  const [dbError, setDbError] = useState(null)
 
   // ── Ephemeral state ───────────────────────────────────────────────────────
   const [tab,             setTab]             = useState('record')
@@ -44,20 +52,63 @@ export default function App() {
   const [showShiftModal,  setShowShiftModal]  = useState(false)
   const [savedFlash,      setSavedFlash]      = useState(null)
 
-  // ── Migrate old flat config format to line-scoped format ──────────────────
+  // ── Load data from Supabase on mount ─────────────────────────────────────
   useEffect(() => {
-    if (config && !config.lines) {
-      setConfig({
-        lines: {
-          [sessionInfo.lineName]: {
-            machines:    config.machines    ?? DEFAULT_LINE_CONFIG.machines,
-            operators:   config.operators   ?? DEFAULT_LINE_CONFIG.operators,
-            assignments: config.assignments ?? DEFAULT_LINE_CONFIG.assignments,
-          },
-        },
-      })
+    async function loadAll() {
+      setLoading(true)
+      try {
+        const [recRes, cfgRes] = await Promise.all([
+          supabase.from('records').select('*').order('id', { ascending: false }),
+          supabase.from('line_configs').select('*'),
+        ])
+        if (recRes.error) throw recRes.error
+        if (cfgRes.error) throw cfgRes.error
+
+        // Map snake_case DB columns → camelCase app fields
+        setRecords(recRes.data.map(r => ({
+          id:          r.id,
+          date:        r.date,
+          machine:     r.machine,
+          operator:    r.operator,
+          operation:   r.operation,
+          category:    r.category,
+          startTime:   r.start_time,
+          endTime:     r.end_time,
+          duration:    r.duration,
+          notes:       r.notes,
+          shift:       r.shift,
+          lineName:    r.line_name,
+          styleNumber: r.style_number,
+        })))
+
+        const cfg = rowsToConfig(cfgRes.data)
+        setConfig(cfg)
+
+        // If current line no longer exists, switch to first available
+        if (cfgRes.data.length > 0 && !cfg.lines[sessionInfo.lineName]) {
+          setSessionInfo(s => ({ ...s, lineName: cfgRes.data[0].line_name }))
+        }
+      } catch (err) {
+        console.error('Supabase load error:', err)
+        setDbError(err.message)
+      } finally {
+        setLoading(false)
+      }
     }
+    loadAll()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Helper: upsert a line config row to Supabase ─────────────────────────
+  const upsertLineConfig = useCallback(async (lineName, lineConfig) => {
+    const { error } = await supabase.from('line_configs').upsert({
+      line_name:   lineName,
+      machines:    lineConfig.machines,
+      operators:   lineConfig.operators,
+      assignments: lineConfig.assignments,
+      updated_at:  new Date().toISOString(),
+    }, { onConflict: 'line_name' })
+    if (error) console.error('upsert line_config error:', error)
+  }, [])
 
   // ── Live timer ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -100,26 +151,47 @@ export default function App() {
     setActiveSessions(p => ({ ...p, [machineId]: { ...p[machineId], ...updates } }))
   }, [])
 
-  const stopTimer = useCallback((machineId, { category, notes }) => {
+  const stopTimer = useCallback(async (machineId, { category, notes }) => {
     const s = activeSessions[machineId]
     if (!s) return
     const duration = Math.max(1, Math.round(s.elapsed / 60))
     const record = {
-      id:          Date.now(),
-      date:        today(),
-      machine:     machineId,
-      operator:    s.operator,
-      operation:   s.operation || '—',
-      category:    category || 'Other',
-      startTime:   s.startTime,
-      endTime:     nowTime(),
+      id:           Date.now(),
+      date:         today(),
+      machine:      machineId,
+      operator:     s.operator,
+      operation:    s.operation || '—',
+      category:     category || 'Other',
+      start_time:   s.startTime,
+      end_time:     nowTime(),
       duration,
-      notes:       notes || '',
-      shift:       sessionInfo.shift,
-      lineName:    sessionInfo.lineName,
-      styleNumber: sessionInfo.styleNumber,
+      notes:        notes || '',
+      shift:        sessionInfo.shift,
+      line_name:    sessionInfo.lineName,
+      style_number: sessionInfo.styleNumber,
     }
-    setRecords(r => [record, ...r])
+    // Insert to Supabase
+    const { data, error } = await supabase.from('records').insert(record).select().single()
+    if (error) {
+      console.error('insert record error:', error)
+    } else {
+      // Add camelCase version to local state
+      setRecords(r => [{
+        id:          data.id,
+        date:        data.date,
+        machine:     data.machine,
+        operator:    data.operator,
+        operation:   data.operation,
+        category:    data.category,
+        startTime:   data.start_time,
+        endTime:     data.end_time,
+        duration:    data.duration,
+        notes:       data.notes,
+        shift:       data.shift,
+        lineName:    data.line_name,
+        styleNumber: data.style_number,
+      }, ...r])
+    }
     setActiveSessions(p => { const n = { ...p }; delete n[machineId]; return n })
     setSavedFlash(machineId)
     setTimeout(() => setSavedFlash(null), 2200)
@@ -132,12 +204,31 @@ export default function App() {
   }, [])
 
   // ── Record management ─────────────────────────────────────────────────────
-  const updateRecord = useCallback((id, updates) => {
+  const updateRecord = useCallback(async (id, updates) => {
+    const dbUpdates = {
+      machine:      updates.machine,
+      operator:     updates.operator,
+      operation:    updates.operation,
+      category:     updates.category,
+      start_time:   updates.startTime,
+      end_time:     updates.endTime,
+      duration:     updates.duration,
+      notes:        updates.notes,
+      shift:        updates.shift,
+      line_name:    updates.lineName,
+      style_number: updates.styleNumber,
+    }
+    // Remove undefined keys
+    Object.keys(dbUpdates).forEach(k => dbUpdates[k] === undefined && delete dbUpdates[k])
+    const { error } = await supabase.from('records').update(dbUpdates).eq('id', id)
+    if (error) { console.error('update record error:', error); return }
     setRecords(r => r.map(rec => rec.id === id ? { ...rec, ...updates } : rec))
     setEditRecord(null)
   }, [])
 
-  const deleteRecord = useCallback((id) => {
+  const deleteRecord = useCallback(async (id) => {
+    const { error } = await supabase.from('records').delete().eq('id', id)
+    if (error) { console.error('delete record error:', error); return }
     setRecords(r => r.filter(rec => rec.id !== id))
     setEditRecord(null)
   }, [])
@@ -147,21 +238,30 @@ export default function App() {
     setSessionInfo(s => ({ ...s, lineName: name }))
   }, [])
 
-  const addLine = useCallback((name) => {
+  const addLine = useCallback(async (name) => {
     const trimmed = name.trim()
-    if (!trimmed) return
-    setConfig(c => {
-      if (c.lines?.[trimmed]) return c   // already exists
-      return { ...c, lines: { ...c.lines, [trimmed]: { ...DEFAULT_LINE_CONFIG } } }
+    if (!trimmed || config.lines?.[trimmed]) return
+    const newLineConfig = { ...DEFAULT_LINE_CONFIG }
+    const { error } = await supabase.from('line_configs').insert({
+      line_name:   trimmed,
+      machines:    newLineConfig.machines,
+      operators:   newLineConfig.operators,
+      assignments: newLineConfig.assignments,
     })
-  }, [])
+    if (error) { console.error('addLine error:', error); return }
+    setConfig(c => ({
+      ...c,
+      lines: { ...c.lines, [trimmed]: newLineConfig },
+    }))
+  }, [config.lines])
 
-  const removeLine = useCallback((name) => {
+  const removeLine = useCallback(async (name) => {
+    const { error } = await supabase.from('line_configs').delete().eq('line_name', name)
+    if (error) { console.error('removeLine error:', error); return }
     setConfig(c => {
       const { [name]: _, ...rest } = c.lines || {}
       return { ...c, lines: rest }
     })
-    // Switch away from deleted line
     if (sessionInfo.lineName === name) {
       const remaining = Object.keys(config.lines || {}).filter(l => l !== name)
       if (remaining.length > 0) setSessionInfo(s => ({ ...s, lineName: remaining[0] }))
@@ -171,50 +271,56 @@ export default function App() {
   // ── Config management (line-scoped) ───────────────────────────────────────
   const ln = sessionInfo.lineName
 
-  const addMachine = useCallback((id) => {
-    setConfig(c => {
-      const lc = getLineConfig(c, ln)
-      if (lc.machines.find(m => m.id === id)) return c
-      return setLineConfig(c, ln, l => ({ ...l, machines: [...l.machines, { id, enabled: true }] }))
-    })
-  }, [ln])
+  const addMachine = useCallback(async (id) => {
+    const lc = getLineConfig(config, ln)
+    if (lc.machines.find(m => m.id === id)) return
+    const updated = { ...lc, machines: [...lc.machines, { id, enabled: true }] }
+    setConfig(c => ({ ...c, lines: { ...c.lines, [ln]: updated } }))
+    await upsertLineConfig(ln, updated)
+  }, [config, ln, upsertLineConfig])
 
-  const updateMachine = useCallback((id, updates) => {
-    setConfig(c => setLineConfig(c, ln, l => ({
-      ...l, machines: l.machines.map(m => m.id === id ? { ...m, ...updates } : m),
-    })))
-  }, [ln])
+  const updateMachine = useCallback(async (id, updates) => {
+    const lc = getLineConfig(config, ln)
+    const updated = { ...lc, machines: lc.machines.map(m => m.id === id ? { ...m, ...updates } : m) }
+    setConfig(c => ({ ...c, lines: { ...c.lines, [ln]: updated } }))
+    await upsertLineConfig(ln, updated)
+  }, [config, ln, upsertLineConfig])
 
-  const removeMachine = useCallback((id) => {
-    setConfig(c => setLineConfig(c, ln, l => ({
-      ...l, machines: l.machines.filter(m => m.id !== id),
-    })))
-  }, [ln])
+  const removeMachine = useCallback(async (id) => {
+    const lc = getLineConfig(config, ln)
+    const updated = { ...lc, machines: lc.machines.filter(m => m.id !== id) }
+    setConfig(c => ({ ...c, lines: { ...c.lines, [ln]: updated } }))
+    await upsertLineConfig(ln, updated)
+  }, [config, ln, upsertLineConfig])
 
-  const addOperator = useCallback((name) => {
-    const id = `op-${Date.now()}`
-    setConfig(c => setLineConfig(c, ln, l => ({
-      ...l, operators: [...l.operators, { id, name }],
-    })))
-  }, [ln])
+  const addOperator = useCallback(async (name) => {
+    const lc = getLineConfig(config, ln)
+    const newOp = { id: `op-${Date.now()}`, name }
+    const updated = { ...lc, operators: [...lc.operators, newOp] }
+    setConfig(c => ({ ...c, lines: { ...c.lines, [ln]: updated } }))
+    await upsertLineConfig(ln, updated)
+  }, [config, ln, upsertLineConfig])
 
-  const updateOperator = useCallback((id, name) => {
-    setConfig(c => setLineConfig(c, ln, l => ({
-      ...l, operators: l.operators.map(op => op.id === id ? { ...op, name } : op),
-    })))
-  }, [ln])
+  const updateOperator = useCallback(async (id, name) => {
+    const lc = getLineConfig(config, ln)
+    const updated = { ...lc, operators: lc.operators.map(op => op.id === id ? { ...op, name } : op) }
+    setConfig(c => ({ ...c, lines: { ...c.lines, [ln]: updated } }))
+    await upsertLineConfig(ln, updated)
+  }, [config, ln, upsertLineConfig])
 
-  const removeOperator = useCallback((id) => {
-    setConfig(c => setLineConfig(c, ln, l => ({
-      ...l, operators: l.operators.filter(op => op.id !== id),
-    })))
-  }, [ln])
+  const removeOperator = useCallback(async (id) => {
+    const lc = getLineConfig(config, ln)
+    const updated = { ...lc, operators: lc.operators.filter(op => op.id !== id) }
+    setConfig(c => ({ ...c, lines: { ...c.lines, [ln]: updated } }))
+    await upsertLineConfig(ln, updated)
+  }, [config, ln, upsertLineConfig])
 
-  const updateAssignment = useCallback((machineId, operatorName) => {
-    setConfig(c => setLineConfig(c, ln, l => ({
-      ...l, assignments: { ...l.assignments, [machineId]: operatorName },
-    })))
-  }, [ln])
+  const updateAssignment = useCallback(async (machineId, operatorName) => {
+    const lc = getLineConfig(config, ln)
+    const updated = { ...lc, assignments: { ...lc.assignments, [machineId]: operatorName } }
+    setConfig(c => ({ ...c, lines: { ...c.lines, [ln]: updated } }))
+    await upsertLineConfig(ln, updated)
+  }, [config, ln, upsertLineConfig])
 
   // ── CSV export ────────────────────────────────────────────────────────────
   const exportCSV = useCallback(() => {
@@ -237,6 +343,23 @@ export default function App() {
   const currentLineConfig = getLineConfig(config, sessionInfo.lineName)
   const enabledMachines   = currentLineConfig.machines.filter(m => m.enabled)
   const activeCount       = Object.keys(activeSessions).length
+
+  // ── Loading / error screens ───────────────────────────────────────────────
+  if (loading) return (
+    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100vh', gap:16, background:'var(--bg)', color:'var(--text)' }}>
+      <div style={{ fontSize:40 }}>⏳</div>
+      <div style={{ fontSize:18, fontWeight:600 }}>Connecting to database…</div>
+    </div>
+  )
+
+  if (dbError) return (
+    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100vh', gap:16, background:'var(--bg)', color:'var(--text)', padding:24 }}>
+      <div style={{ fontSize:40 }}>❌</div>
+      <div style={{ fontSize:18, fontWeight:600, textAlign:'center' }}>Database connection failed</div>
+      <div style={{ fontSize:13, color:'var(--muted)', textAlign:'center', maxWidth:320 }}>{dbError}</div>
+      <div style={{ fontSize:13, color:'var(--muted)', textAlign:'center', maxWidth:320 }}>Check your <code>.env</code> file has the correct VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.</div>
+    </div>
+  )
 
   return (
     <div className="app">
