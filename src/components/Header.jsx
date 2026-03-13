@@ -1,6 +1,6 @@
 import { ACCENT } from '../constants'
 
-export default function Header({ sessionInfo, lineNames, activeCount, onChangeLine, onEditShift, onExportCSV }) {
+export default function Header({ sessionInfo, lineNames, activeCount, onChangeLine, onEditShift, onExportCSV, onLogout }) {
   const { lineName, shift, styleNumber } = sessionInfo
 
   return (
@@ -21,6 +21,17 @@ export default function Header({ sessionInfo, lineNames, activeCount, onChangeLi
           )}
           <button className="btn-ghost" onClick={onExportCSV} style={{ padding: '8px 12px', fontSize: 11, minHeight: 36 }}>
             ⬇ CSV
+          </button>
+          <button
+            onClick={onLogout}
+            style={{
+              padding: '8px 12px', fontSize: 11, minHeight: 36,
+              background: 'none', border: '1px solid #EF444444',
+              color: '#EF4444', borderRadius: 8, cursor: 'pointer',
+              fontFamily: 'var(--font-mono)', letterSpacing: 0.5,
+            }}
+          >
+            🔓 Out
           </button>
         </div>
       </div>

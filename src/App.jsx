@@ -9,6 +9,7 @@ import BottomNav       from './components/BottomNav'
 import RecordPanel     from './components/RecordPanel'
 import EditRecordModal from './components/EditRecordModal'
 import ShiftModal      from './components/ShiftModal'
+import LoginScreen     from './components/LoginScreen'
 
 import RecordTab    from './components/tabs/RecordTab'
 import DashboardTab from './components/tabs/DashboardTab'
@@ -35,6 +36,10 @@ function rowsToConfig(rows) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
+  // ── Auth state ────────────────────────────────────────────────────────────
+  const [user,        setUser]        = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+
   // ── Session info stays in localStorage (per-device UI state) ─────────────
   const [sessionInfo, setSessionInfo] = useLocalStorage('dt_session', DEFAULT_SESSION_INFO)
 
@@ -52,8 +57,21 @@ export default function App() {
   const [showShiftModal,  setShowShiftModal]  = useState(false)
   const [savedFlash,      setSavedFlash]      = useState(null)
 
-  // ── Load data from Supabase on mount ─────────────────────────────────────
+  // ── Auth: check session on mount + listen for changes ────────────────────
   useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null)
+      setAuthLoading(false)
+    })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null)
+    })
+    return () => subscription.unsubscribe()
+  }, [])
+
+  // ── Load data from Supabase (only when logged in) ─────────────────────────
+  useEffect(() => {
+    if (!user) return
     async function loadAll() {
       setLoading(true)
       try {
@@ -96,7 +114,7 @@ export default function App() {
       }
     }
     loadAll()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [user]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Helper: upsert a line config row to Supabase ─────────────────────────
   const upsertLineConfig = useCallback(async (lineName, lineConfig) => {
@@ -322,6 +340,13 @@ export default function App() {
     await upsertLineConfig(ln, updated)
   }, [config, ln, upsertLineConfig])
 
+  // ── Logout ────────────────────────────────────────────────────────────────
+  const logout = useCallback(async () => {
+    await supabase.auth.signOut()
+    setRecords([])
+    setConfig({ lines: {} })
+  }, [])
+
   // ── CSV export ────────────────────────────────────────────────────────────
   const exportCSV = useCallback(() => {
     const h = ['ID','Date','Machine','Operator','Operation','Category','Start','End','Duration (min)','Shift','Line','Style','Notes']
@@ -344,7 +369,16 @@ export default function App() {
   const enabledMachines   = currentLineConfig.machines.filter(m => m.enabled)
   const activeCount       = Object.keys(activeSessions).length
 
-  // ── Loading / error screens ───────────────────────────────────────────────
+  // ── Auth / loading / error screens ───────────────────────────────────────
+  if (authLoading) return (
+    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100vh', gap:16, background:'var(--bg)', color:'var(--text)' }}>
+      <div style={{ fontSize:40 }}>⏳</div>
+      <div style={{ fontSize:18, fontWeight:600 }}>Loading…</div>
+    </div>
+  )
+
+  if (!user) return <LoginScreen />
+
   if (loading) return (
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100vh', gap:16, background:'var(--bg)', color:'var(--text)' }}>
       <div style={{ fontSize:40 }}>⏳</div>
@@ -370,6 +404,7 @@ export default function App() {
         onChangeLine={changeLine}
         onEditShift={() => setShowShiftModal(true)}
         onExportCSV={exportCSV}
+        onLogout={logout}
       />
 
       <main className="main-content">
